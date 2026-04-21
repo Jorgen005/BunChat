@@ -1,8 +1,51 @@
-import { useState, useEffect, useRef } from 'react';
-import { joinRoom, selfId } from 'trystero';
+import { useState, useEffect, useRef, type CSSProperties } from 'react';
+import { joinRoom } from 'trystero';
 
 const APP_ID = 'norway-friends-p2p-v1';
 const ROOM_ID = 'southern-norway-20';
+
+interface ChatMessage {
+  username: string;
+  text: string;
+}
+
+interface VoiceStatusMessage {
+  username: string;
+  inVoice: boolean;
+}
+
+// Hoisted outside component — no new object allocated per render
+const S: Record<string, CSSProperties> = {
+  setupRoot:    { display: 'flex', height: '100vh', background: '#202225', color: '#fff', alignItems: 'center', justifyContent: 'center' },
+  setupBox:     { background: '#2f3136', padding: '40px', borderRadius: '8px', width: '400px', textAlign: 'center' },
+  setupNote:    { margin: '20px 0' },
+  setupInput:   { width: '100%', padding: '12px', fontSize: '18px', background: '#40444b', border: 'none', borderRadius: '4px', color: '#fff', marginBottom: '20px' },
+  setupButton:  { padding: '12px 40px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontSize: '16px' },
+  root:         { display: 'flex', height: '100vh', background: '#202225', color: '#fff', fontFamily: 'system-ui, sans-serif', overflow: 'hidden' },
+  sidebar:      { width: '280px', background: '#2f3136', padding: '20px', borderRight: '1px solid #202225' },
+  hr:           { borderColor: '#40444b', margin: '20px 0' },
+  hrVoice:      { borderColor: '#40444b', margin: '30px 0 10px' },
+  onlineUser:   { color: '#b9bbbe', margin: '6px 0' },
+  voiceUser:    { margin: '8px 0', display: 'flex', alignItems: 'center', gap: '8px' },
+  voiceDot:     { color: '#3ba55c' },
+  voiceUserFlex:{ flex: 1 },
+  volumeSlider: { width: '80px' },
+  chatArea:     { flex: 1, display: 'flex', flexDirection: 'column' },
+  chatHeader:   { padding: '12px 20px', background: '#36393f', borderBottom: '1px solid #202225', fontWeight: 600 },
+  messageList:  { flex: 1, padding: '20px', overflowY: 'auto' },
+  message:      { marginBottom: '16px' },
+  inputRow:     { padding: '16px', background: '#36393f' },
+  inputFlex:    { display: 'flex' },
+  messageInput: { flex: 1, padding: '12px', background: '#40444b', border: 'none', borderRadius: '4px', color: '#fff', outline: 'none' },
+  sendButton:   { marginLeft: '8px', padding: '12px 24px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontWeight: 600 },
+  voicePanel:   { width: '260px', background: '#2f3136', padding: '20px', borderLeft: '1px solid #202225' },
+};
+
+// Two constant objects per dynamic button — avoids allocating a new object every render
+const joinButtonOn:  CSSProperties = { width: '100%', padding: '14px', background: '#ed4245', color: 'white', border: 'none', borderRadius: '4px', fontSize: '16px', fontWeight: 600, marginBottom: '12px' };
+const joinButtonOff: CSSProperties = { width: '100%', padding: '14px', background: '#3ba55c', color: 'white', border: 'none', borderRadius: '4px', fontSize: '16px', fontWeight: 600, marginBottom: '12px' };
+const muteButtonOn:  CSSProperties = { width: '100%', padding: '12px', background: '#ed4245', color: 'white', border: 'none', borderRadius: '4px' };
+const muteButtonOff: CSSProperties = { width: '100%', padding: '12px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px' };
 
 function App() {
   const [username, setUsername] = useState('');
@@ -18,8 +61,14 @@ function App() {
   const selfStreamRef = useRef<MediaStream | null>(null);
   const remoteAudiosRef = useRef<{ [peerId: string]: HTMLAudioElement }>({});
   const volumesRef = useRef<{ [username: string]: number }>({});
+  // Cached send functions — created once in the effect, not on every call
+  const sendChatRef = useRef<((data: ChatMessage) => void) | null>(null);
+  const sendVoiceStatusRef = useRef<((data: VoiceStatusMessage) => void) | null>(null);
+  // Bidirectional username <-> peerId mapping for correct per-user volume control
+  const peerUsernameRef = useRef<{ [peerId: string]: string }>({});
+  const usernamePeerRef = useRef<{ [username: string]: string }>({});
+  const usernameInputRef = useRef<HTMLInputElement>(null);
 
-  // Username setup
   useEffect(() => {
     const saved = localStorage.getItem('p2p-username');
     if (saved) {
@@ -29,7 +78,6 @@ function App() {
     }
   }, []);
 
-  // Join room
   useEffect(() => {
     if (!username) return;
 
@@ -41,13 +89,18 @@ function App() {
     roomRef.current = room;
 
     const [sendChat, getChat] = room.makeAction('chat');
-    getChat((data: any) => {
+    sendChatRef.current = sendChat;
+    getChat((data: ChatMessage, peerId: string) => {
+      peerUsernameRef.current[peerId] = data.username;
+      usernamePeerRef.current[data.username] = peerId;
       setMessages(prev => [...prev, { id: Date.now().toString(), from: data.username, text: data.text }]);
     });
 
-    // Voice status from others
     const [sendVoiceStatus, getVoiceStatus] = room.makeAction('voiceStatus');
-    getVoiceStatus((data: any) => {
+    sendVoiceStatusRef.current = sendVoiceStatus;
+    getVoiceStatus((data: VoiceStatusMessage, peerId: string) => {
+      peerUsernameRef.current[peerId] = data.username;
+      usernamePeerRef.current[data.username] = peerId;
       if (data.inVoice) {
         setInVoiceUsers(prev => prev.includes(data.username) ? prev : [...prev, data.username]);
       } else {
@@ -55,27 +108,54 @@ function App() {
       }
     });
 
-    // Online list
     const updateOnline = () => {
       const peers = room.getPeers ? Object.keys(room.getPeers()) : [];
-      setOnlineUsers([username, ...peers.map(p => `User-${p.slice(0,6)}`)]);
+      setOnlineUsers([username, ...peers.map((p: string) => `User-${p.slice(0, 6)}`)]);
     };
+
     room.onPeerJoin(updateOnline);
-    room.onPeerLeave(updateOnline);
-    const interval = setInterval(updateOnline, 2000);
+    room.onPeerLeave((peerId: string) => {
+      const audio = remoteAudiosRef.current[peerId];
+      if (audio) {
+        audio.pause();
+        (audio.srcObject as MediaStream | null)?.getTracks().forEach(t => t.stop());
+        audio.srcObject = null;
+        delete remoteAudiosRef.current[peerId];
+      }
+      const leavingUsername = peerUsernameRef.current[peerId];
+      if (leavingUsername) {
+        setInVoiceUsers(prev => prev.filter(u => u !== leavingUsername));
+        delete usernamePeerRef.current[leavingUsername];
+        delete peerUsernameRef.current[peerId];
+      }
+      updateOnline();
+    });
+
     updateOnline();
 
-    // Real voice streaming
     room.onPeerStream((stream: MediaStream, peerId: string) => {
       const audio = new Audio();
       audio.srcObject = stream;
       audio.autoplay = true;
+      // Apply any volume the user already set before the stream arrived
+      const savedVolume = peerUsernameRef.current[peerId]
+        ? volumesRef.current[peerUsernameRef.current[peerId]]
+        : undefined;
+      if (savedVolume !== undefined) audio.volume = savedVolume;
       remoteAudiosRef.current[peerId] = audio;
     });
 
     return () => {
-      clearInterval(interval);
       room.leave();
+      Object.keys(remoteAudiosRef.current).forEach(peerId => {
+        const audio = remoteAudiosRef.current[peerId];
+        audio.pause();
+        (audio.srcObject as MediaStream | null)?.getTracks().forEach(t => t.stop());
+        audio.srcObject = null;
+      });
+      remoteAudiosRef.current = {};
+      peerUsernameRef.current = {};
+      usernamePeerRef.current = {};
     };
   }, [username]);
 
@@ -87,9 +167,8 @@ function App() {
   };
 
   const sendMessage = () => {
-    if (!newMessage.trim() || !roomRef.current) return;
-    const [sendChat] = roomRef.current.makeAction('chat');
-    sendChat({ username, text: newMessage });
+    if (!newMessage.trim() || !sendChatRef.current) return;
+    sendChatRef.current({ username, text: newMessage });
     setMessages(prev => [...prev, { id: Date.now().toString(), from: 'You', text: newMessage }]);
     setNewMessage('');
   };
@@ -97,8 +176,7 @@ function App() {
   const toggleVoice = async () => {
     if (isInVoice) {
       if (selfStreamRef.current) selfStreamRef.current.getTracks().forEach(t => t.stop());
-      const [sendVoiceStatus] = roomRef.current.makeAction('voiceStatus');
-      sendVoiceStatus({ username, inVoice: false });
+      sendVoiceStatusRef.current?.({ username, inVoice: false });
       setInVoiceUsers(prev => prev.filter(u => u !== username));
       setIsInVoice(false);
     } else {
@@ -108,13 +186,9 @@ function App() {
         });
         selfStreamRef.current = stream;
         setIsInVoice(true);
-
         roomRef.current.addStream(stream);
-
-        const [sendVoiceStatus] = roomRef.current.makeAction('voiceStatus');
-        sendVoiceStatus({ username, inVoice: true });
+        sendVoiceStatusRef.current?.({ username, inVoice: true });
         setInVoiceUsers(prev => prev.includes(username) ? prev : [...prev, username]);
-
       } catch (err) {
         alert('Could not access microphone');
       }
@@ -130,26 +204,29 @@ function App() {
   };
 
   const changeVolume = (targetUsername: string, value: number) => {
-    volumesRef.current[targetUsername] = value / 100;
-    Object.keys(remoteAudiosRef.current).forEach(key => {
-      const audio = remoteAudiosRef.current[key];
-      if (audio) audio.volume = volumesRef.current[targetUsername] || 1;
-    });
+    const volume = value / 100;
+    volumesRef.current[targetUsername] = volume;
+    const peerId = usernamePeerRef.current[targetUsername];
+    if (peerId) {
+      const audio = remoteAudiosRef.current[peerId];
+      if (audio) audio.volume = volume;
+    }
   };
 
   if (showSetup) {
     return (
-      <div style={{ display: 'flex', height: '100vh', background: '#202225', color: '#fff', alignItems: 'center', justifyContent: 'center' }}>
-        <div style={{ background: '#2f3136', padding: '40px', borderRadius: '8px', width: '400px', textAlign: 'center' }}>
+      <div style={S.setupRoot}>
+        <div style={S.setupBox}>
           <h2>Welcome to Norway Friends</h2>
-          <p style={{ margin: '20px 0' }}>Choose your permanent username (cannot be changed later)</p>
+          <p style={S.setupNote}>Choose your permanent username (cannot be changed later)</p>
           <input
+            ref={usernameInputRef}
             type="text"
             placeholder="Enter username"
-            onKeyDown={(e) => e.key === 'Enter' && saveUsername((e.target as HTMLInputElement).value)}
-            style={{ width: '100%', padding: '12px', fontSize: '18px', background: '#40444b', border: 'none', borderRadius: '4px', color: '#fff', marginBottom: '20px' }}
+            onKeyDown={(e) => e.key === 'Enter' && saveUsername(usernameInputRef.current?.value || '')}
+            style={S.setupInput}
           />
-          <button onClick={() => saveUsername((document.querySelector('input') as HTMLInputElement).value)} style={{ padding: '12px 40px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontSize: '16px' }}>
+          <button onClick={() => saveUsername(usernameInputRef.current?.value || '')} style={S.setupButton}>
             Continue
           </button>
         </div>
@@ -158,64 +235,64 @@ function App() {
   }
 
   return (
-    <div style={{ display: 'flex', height: '100vh', background: '#202225', color: '#fff', fontFamily: 'system-ui, sans-serif', overflow: 'hidden' }}>
+    <div style={S.root}>
       {/* Sidebar */}
-      <div style={{ width: '280px', background: '#2f3136', padding: '20px', borderRight: '1px solid #202225' }}>
+      <div style={S.sidebar}>
         <h2>Norway Friends</h2>
         <p>Room: {ROOM_ID}</p>
         <p>Your name: {username}</p>
-        <hr style={{ borderColor: '#40444b', margin: '20px 0' }} />
+        <hr style={S.hr} />
 
         <h3>Online ({onlineUsers.length})</h3>
-        {onlineUsers.map((user, i) => (
-          <div key={i} style={{ color: '#b9bbbe', margin: '6px 0' }}>
+        {onlineUsers.map((user) => (
+          <div key={`online-${user}`} style={S.onlineUser}>
             ● {user}
           </div>
         ))}
 
-        <hr style={{ borderColor: '#40444b', margin: '30px 0 10px' }} />
+        <hr style={S.hrVoice} />
 
         <h3>In Voice ({inVoiceUsers.length})</h3>
-        {inVoiceUsers.map((user, i) => (
-          <div key={i} style={{ margin: '8px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <span style={{ color: '#3ba55c' }}>●</span>
-            <span style={{ flex: 1 }}>{user}</span>
+        {inVoiceUsers.map((user) => (
+          <div key={`voice-${user}`} style={S.voiceUser}>
+            <span style={S.voiceDot}>●</span>
+            <span style={S.voiceUserFlex}>{user}</span>
             <input
               type="range"
               min="0"
               max="200"
               defaultValue="100"
-              onChange={(e) => changeVolume(user, parseInt(e.target.value))}
-              style={{ width: '80px' }}
+              onChange={(e) => changeVolume(user, Number(e.currentTarget.value))}
+              style={S.volumeSlider}
             />
           </div>
         ))}
       </div>
 
       {/* Main Chat */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-        <div style={{ padding: '12px 20px', background: '#36393f', borderBottom: '1px solid #202225', fontWeight: '600' }}>
+      <div style={S.chatArea}>
+        <div style={S.chatHeader}>
           General Chat • Voice Meeting
         </div>
 
-        <div style={{ flex: 1, padding: '20px', overflowY: 'auto' }}>
+        <div style={S.messageList}>
           {messages.map(m => (
-            <div key={m.id} style={{ marginBottom: '16px' }}>
+            <div key={m.id} style={S.message}>
               <strong>{m.from}:</strong> {m.text}
             </div>
           ))}
         </div>
 
-        <div style={{ padding: '16px', background: '#36393f' }}>
-          <div style={{ display: 'flex' }}>
+        <div style={S.inputRow}>
+          <div style={S.inputFlex}>
             <input
               value={newMessage}
               onChange={e => setNewMessage(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && sendMessage()}
               placeholder="Type a message..."
-              style={{ flex: 1, padding: '12px', background: '#40444b', border: 'none', borderRadius: '4px', color: '#fff', outline: 'none' }}
+              style={S.messageInput}
             />
-            <button onClick={sendMessage} style={{ marginLeft: '8px', padding: '12px 24px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontWeight: '600' }}>
+            <button onClick={sendMessage} style={S.sendButton}>
               Send
             </button>
           </div>
@@ -223,20 +300,10 @@ function App() {
       </div>
 
       {/* Voice Panel */}
-      <div style={{ width: '260px', background: '#2f3136', padding: '20px', borderLeft: '1px solid #202225' }}>
+      <div style={S.voicePanel}>
         <button
           onClick={toggleVoice}
-          style={{
-            width: '100%',
-            padding: '14px',
-            background: isInVoice ? '#ed4245' : '#3ba55c',
-            color: 'white',
-            border: 'none',
-            borderRadius: '4px',
-            fontSize: '16px',
-            fontWeight: '600',
-            marginBottom: '12px'
-          }}
+          style={isInVoice ? joinButtonOn : joinButtonOff}
         >
           {isInVoice ? 'Leave Voice Meeting' : 'Join Voice Meeting'}
         </button>
@@ -244,7 +311,7 @@ function App() {
         {isInVoice && (
           <button
             onClick={toggleMute}
-            style={{ width: '100%', padding: '12px', background: isMuted ? '#ed4245' : '#5865f2', color: 'white', border: 'none', borderRadius: '4px' }}
+            style={isMuted ? muteButtonOn : muteButtonOff}
           >
             {isMuted ? 'Unmute' : 'Mute'}
           </button>
