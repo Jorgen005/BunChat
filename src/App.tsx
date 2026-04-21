@@ -14,38 +14,53 @@ interface VoiceStatusMessage {
   inVoice: boolean;
 }
 
+interface PeerKeyMessage {
+  publicKeyBase64: string;
+}
+
+interface RelayAvailMessage {
+  isRelay: boolean;
+}
+
 // Hoisted outside component — no new object allocated per render
 const S: Record<string, CSSProperties> = {
-  setupRoot:    { display: 'flex', height: '100vh', background: '#202225', color: '#fff', alignItems: 'center', justifyContent: 'center' },
-  setupBox:     { background: '#2f3136', padding: '40px', borderRadius: '8px', width: '400px', textAlign: 'center' },
-  setupNote:    { margin: '20px 0' },
-  setupInput:   { width: '100%', padding: '12px', fontSize: '18px', background: '#40444b', border: 'none', borderRadius: '4px', color: '#fff', marginBottom: '20px' },
-  setupButton:  { padding: '12px 40px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontSize: '16px' },
-  root:         { display: 'flex', height: '100vh', background: '#202225', color: '#fff', fontFamily: 'system-ui, sans-serif', overflow: 'hidden' },
-  sidebar:      { width: '280px', background: '#2f3136', padding: '20px', borderRight: '1px solid #202225' },
-  hr:           { borderColor: '#40444b', margin: '20px 0' },
-  hrVoice:      { borderColor: '#40444b', margin: '30px 0 10px' },
-  onlineUser:   { color: '#b9bbbe', margin: '6px 0' },
-  voiceUser:    { margin: '8px 0', display: 'flex', alignItems: 'center', gap: '8px' },
-  voiceDot:     { color: '#3ba55c' },
-  voiceUserFlex:{ flex: 1 },
-  volumeSlider: { width: '80px' },
-  chatArea:     { flex: 1, display: 'flex', flexDirection: 'column' },
-  chatHeader:   { padding: '12px 20px', background: '#36393f', borderBottom: '1px solid #202225', fontWeight: 600 },
-  messageList:  { flex: 1, padding: '20px', overflowY: 'auto' },
-  message:      { marginBottom: '16px' },
-  inputRow:     { padding: '16px', background: '#36393f' },
-  inputFlex:    { display: 'flex' },
-  messageInput: { flex: 1, padding: '12px', background: '#40444b', border: 'none', borderRadius: '4px', color: '#fff', outline: 'none' },
-  sendButton:   { marginLeft: '8px', padding: '12px 24px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontWeight: 600 },
-  voicePanel:   { width: '260px', background: '#2f3136', padding: '20px', borderLeft: '1px solid #202225' },
+  setupRoot:           { display: 'flex', height: '100vh', background: '#202225', color: '#fff', alignItems: 'center', justifyContent: 'center' },
+  setupBox:            { background: '#2f3136', padding: '40px', borderRadius: '8px', width: '400px', textAlign: 'center' },
+  setupNote:           { margin: '20px 0' },
+  setupInput:          { width: '100%', padding: '12px', fontSize: '18px', background: '#40444b', border: 'none', borderRadius: '4px', color: '#fff', marginBottom: '20px' },
+  setupButton:         { padding: '12px 40px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontSize: '16px' },
+  root:                { display: 'flex', height: '100vh', background: '#202225', color: '#fff', fontFamily: 'system-ui, sans-serif', overflow: 'hidden' },
+  sidebar:             { width: '280px', background: '#2f3136', padding: '20px', borderRight: '1px solid #202225', overflowY: 'auto' },
+  hr:                  { borderColor: '#40444b', margin: '20px 0' },
+  hrVoice:             { borderColor: '#40444b', margin: '30px 0 10px' },
+  onlineUser:          { color: '#b9bbbe', margin: '6px 0' },
+  voiceUser:           { margin: '8px 0', display: 'flex', alignItems: 'center', gap: '8px' },
+  voiceDot:            { color: '#3ba55c' },
+  voiceUserFlex:       { flex: 1 },
+  volumeSlider:        { width: '80px' },
+  chatArea:            { flex: 1, display: 'flex', flexDirection: 'column' },
+  chatHeader:          { padding: '12px 20px', background: '#36393f', borderBottom: '1px solid #202225', fontWeight: 600 },
+  messageList:         { flex: 1, padding: '20px', overflowY: 'auto' },
+  message:             { marginBottom: '16px' },
+  inputRow:            { padding: '16px', background: '#36393f' },
+  inputFlex:           { display: 'flex' },
+  messageInput:        { flex: 1, padding: '12px', background: '#40444b', border: 'none', borderRadius: '4px', color: '#fff', outline: 'none' },
+  sendButton:          { marginLeft: '8px', padding: '12px 24px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontWeight: 600 },
+  voicePanel:          { width: '260px', background: '#2f3136', padding: '20px', borderLeft: '1px solid #202225', overflowY: 'auto' },
+  relayCount:          { fontSize: '12px', color: '#72767d', textAlign: 'center', margin: '6px 0 4px' },
+  searchInput:         { width: '100%', padding: '8px', background: '#40444b', border: 'none', borderRadius: '4px', color: '#fff', outline: 'none', boxSizing: 'border-box', marginBottom: '6px' },
+  searchInputDisabled: { width: '100%', padding: '8px', background: '#2c2f33', border: 'none', borderRadius: '4px', color: '#4f545c', outline: 'none', boxSizing: 'border-box', marginBottom: '6px', cursor: 'not-allowed' },
 };
 
 // Two constant objects per dynamic button — avoids allocating a new object every render
-const joinButtonOn:  CSSProperties = { width: '100%', padding: '14px', background: '#ed4245', color: 'white', border: 'none', borderRadius: '4px', fontSize: '16px', fontWeight: 600, marginBottom: '12px' };
-const joinButtonOff: CSSProperties = { width: '100%', padding: '14px', background: '#3ba55c', color: 'white', border: 'none', borderRadius: '4px', fontSize: '16px', fontWeight: 600, marginBottom: '12px' };
-const muteButtonOn:  CSSProperties = { width: '100%', padding: '12px', background: '#ed4245', color: 'white', border: 'none', borderRadius: '4px' };
-const muteButtonOff: CSSProperties = { width: '100%', padding: '12px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px' };
+const joinButtonOn:       CSSProperties = { width: '100%', padding: '14px', background: '#ed4245', color: 'white', border: 'none', borderRadius: '4px', fontSize: '16px', fontWeight: 600, marginBottom: '12px' };
+const joinButtonOff:      CSSProperties = { width: '100%', padding: '14px', background: '#3ba55c', color: 'white', border: 'none', borderRadius: '4px', fontSize: '16px', fontWeight: 600, marginBottom: '12px' };
+const muteButtonOn:       CSSProperties = { width: '100%', padding: '12px', background: '#ed4245', color: 'white', border: 'none', borderRadius: '4px' };
+const muteButtonOff:      CSSProperties = { width: '100%', padding: '12px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px' };
+const relayButtonOn:      CSSProperties = { width: '100%', padding: '10px', background: '#3ba55c', color: 'white', border: 'none', borderRadius: '4px', marginBottom: '4px', fontSize: '14px', cursor: 'pointer' };
+const relayButtonOff:     CSSProperties = { width: '100%', padding: '10px', background: '#40444b', color: '#b9bbbe', border: 'none', borderRadius: '4px', marginBottom: '4px', fontSize: '14px', cursor: 'pointer' };
+const searchButtonSafe:   CSSProperties = { width: '100%', padding: '10px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontSize: '14px', cursor: 'pointer', fontWeight: 600 };
+const searchButtonUnsafe: CSSProperties = { width: '100%', padding: '10px', background: '#2c2f33', color: '#4f545c', border: '1px solid #40444b', borderRadius: '4px', fontSize: '13px', cursor: 'not-allowed' };
 
 function App() {
   const [username, setUsername] = useState('');
@@ -56,6 +71,9 @@ function App() {
   const [isMuted, setIsMuted] = useState(false);
   const [newMessage, setNewMessage] = useState('');
   const [showSetup, setShowSetup] = useState(false);
+  const [isRelayEnabled, setIsRelayEnabled] = useState(false);
+  const [availableRelays, setAvailableRelays] = useState<string[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
 
   const roomRef = useRef<any>(null);
   const selfStreamRef = useRef<MediaStream | null>(null);
@@ -68,6 +86,30 @@ function App() {
   const peerUsernameRef = useRef<{ [peerId: string]: string }>({});
   const usernamePeerRef = useRef<{ [username: string]: string }>({});
   const usernameInputRef = useRef<HTMLInputElement>(null);
+  // Crypto — ECDH keypair for onion-layer encryption (used in Phase 2+)
+  const myPublicKeyRef = useRef<string>('');
+  const myPrivateKeyRef = useRef<CryptoKey | null>(null);
+  const peerPublicKeysRef = useRef<{ [peerId: string]: string }>({});
+  // Relay availability
+  const isRelayEnabledRef = useRef(false);
+  const sendPeerKeyRef = useRef<((data: PeerKeyMessage, target?: string | string[]) => void) | null>(null);
+  const sendRelayRef = useRef<((data: RelayAvailMessage, target?: string | string[]) => void) | null>(null);
+
+  // Generate ECDH P-256 keypair once on mount.
+  // Private key stays in memory only — public key is shared with peers so they
+  // can encrypt the onion layer addressed to us (Phase 2).
+  useEffect(() => {
+    (async () => {
+      const kp = await window.crypto.subtle.generateKey(
+        { name: 'ECDH', namedCurve: 'P-256' },
+        true,
+        ['deriveKey', 'deriveBits']
+      );
+      myPrivateKeyRef.current = kp.privateKey;
+      const raw = await window.crypto.subtle.exportKey('raw', kp.publicKey);
+      myPublicKeyRef.current = btoa(String.fromCharCode(...new Uint8Array(raw)));
+    })();
+  }, []);
 
   useEffect(() => {
     const saved = localStorage.getItem('p2p-username');
@@ -108,12 +150,40 @@ function App() {
       }
     });
 
+    // Key exchange — each peer shares their ECDH public key so others can
+    // address onion-encrypted relay hops to them in Phase 2.
+    const [sendPeerKey, getPeerKey] = room.makeAction('peerKey');
+    sendPeerKeyRef.current = sendPeerKey;
+    getPeerKey((data: PeerKeyMessage, peerId: string) => {
+      peerPublicKeysRef.current[peerId] = data.publicKeyBase64;
+    });
+
+    // Relay availability — peers opt in / out of acting as relay nodes.
+    const [sendRelay, getRelay] = room.makeAction('relayAvail');
+    sendRelayRef.current = sendRelay;
+    getRelay((data: RelayAvailMessage, peerId: string) => {
+      if (data.isRelay) {
+        setAvailableRelays(prev => prev.includes(peerId) ? prev : [...prev, peerId]);
+      } else {
+        setAvailableRelays(prev => prev.filter(id => id !== peerId));
+      }
+    });
+
     const updateOnline = () => {
       const peers = room.getPeers ? Object.keys(room.getPeers()) : [];
       setOnlineUsers([username, ...peers.map((p: string) => `User-${p.slice(0, 6)}`)]);
     };
 
-    room.onPeerJoin(updateOnline);
+    room.onPeerJoin((peerId: string) => {
+      // Send our public key and relay status directly to the new peer so they
+      // don't have to wait for a broadcast they've already missed.
+      if (myPublicKeyRef.current) {
+        sendPeerKeyRef.current?.({ publicKeyBase64: myPublicKeyRef.current }, peerId);
+      }
+      sendRelayRef.current?.({ isRelay: isRelayEnabledRef.current }, peerId);
+      updateOnline();
+    });
+
     room.onPeerLeave((peerId: string) => {
       const audio = remoteAudiosRef.current[peerId];
       if (audio) {
@@ -128,10 +198,19 @@ function App() {
         delete usernamePeerRef.current[leavingUsername];
         delete peerUsernameRef.current[peerId];
       }
+      // Remove from relay pool and key store
+      setAvailableRelays(prev => prev.filter(id => id !== peerId));
+      delete peerPublicKeysRef.current[peerId];
       updateOnline();
     });
 
     updateOnline();
+
+    // Broadcast our key and current relay status to all peers already in the room
+    if (myPublicKeyRef.current) {
+      sendPeerKeyRef.current?.({ publicKeyBase64: myPublicKeyRef.current });
+    }
+    sendRelayRef.current?.({ isRelay: isRelayEnabledRef.current });
 
     room.onPeerStream((stream: MediaStream, peerId: string) => {
       const audio = new Audio();
@@ -156,6 +235,7 @@ function App() {
       remoteAudiosRef.current = {};
       peerUsernameRef.current = {};
       usernamePeerRef.current = {};
+      peerPublicKeysRef.current = {};
     };
   }, [username]);
 
@@ -212,6 +292,21 @@ function App() {
       if (audio) audio.volume = volume;
     }
   };
+
+  const toggleRelay = () => {
+    const next = !isRelayEnabled;
+    setIsRelayEnabled(next);
+    isRelayEnabledRef.current = next;
+    sendRelayRef.current?.({ isRelay: next });
+  };
+
+  // Placeholder — Phase 2 will build the onion circuit and route through relays
+  const handleSearch = () => {
+    if (!canSearch || !searchQuery.trim()) return;
+  };
+
+  const canSearch = availableRelays.length >= 3;
+  const relayShortfall = Math.max(0, 3 - availableRelays.length);
 
   if (showSetup) {
     return (
@@ -299,23 +394,46 @@ function App() {
         </div>
       </div>
 
-      {/* Voice Panel */}
+      {/* Voice + Relay + Search Panel */}
       <div style={S.voicePanel}>
-        <button
-          onClick={toggleVoice}
-          style={isInVoice ? joinButtonOn : joinButtonOff}
-        >
+        <button onClick={toggleVoice} style={isInVoice ? joinButtonOn : joinButtonOff}>
           {isInVoice ? 'Leave Voice Meeting' : 'Join Voice Meeting'}
         </button>
 
         {isInVoice && (
-          <button
-            onClick={toggleMute}
-            style={isMuted ? muteButtonOn : muteButtonOff}
-          >
+          <button onClick={toggleMute} style={isMuted ? muteButtonOn : muteButtonOff}>
             {isMuted ? 'Unmute' : 'Mute'}
           </button>
         )}
+
+        <hr style={S.hr} />
+
+        <button onClick={toggleRelay} style={isRelayEnabled ? relayButtonOn : relayButtonOff}>
+          {isRelayEnabled ? 'Relay: ON' : 'Relay: OFF'}
+        </button>
+        <div style={S.relayCount}>
+          {availableRelays.length} relay{availableRelays.length !== 1 ? 's' : ''} online
+        </div>
+
+        <hr style={S.hr} />
+
+        <input
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && handleSearch()}
+          placeholder={canSearch ? 'Search...' : 'Need more relays...'}
+          disabled={!canSearch}
+          style={canSearch ? S.searchInput : S.searchInputDisabled}
+        />
+        <button
+          onClick={handleSearch}
+          disabled={!canSearch}
+          style={canSearch ? searchButtonSafe : searchButtonUnsafe}
+        >
+          {canSearch
+            ? 'Search'
+            : `Unsafe, ${relayShortfall} peer${relayShortfall !== 1 ? 's' : ''} needed`}
+        </button>
       </div>
     </div>
   );
