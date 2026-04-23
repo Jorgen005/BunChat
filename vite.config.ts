@@ -6,15 +6,12 @@ export default defineConfig({
   build: {
     rollupOptions: {
       output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom'],
-          p2p: ['trystero'],
+        manualChunks: (id) => {
+          if (id.includes('node_modules/react') || id.includes('node_modules/react-dom')) return 'vendor';
+          if (id.includes('node_modules/trystero')) return 'p2p';
         },
       },
     },
     target: 'esnext',
-  },
-  esbuild: {
-    drop: ['console'],
   },
 })
