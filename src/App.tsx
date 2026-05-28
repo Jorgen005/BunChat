@@ -1,10 +1,14 @@
 import { useState, useEffect, useRef, useCallback, type CSSProperties } from 'react';
 import { joinRoom } from 'trystero';
 import { invoke } from '@tauri-apps/api/core';
+import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 const APP_ID             = 'norway-friends-p2p-v1';
 const DEFAULT_ROOM_ID    = 'southern-norway-20';
 const DEFAULT_ROOM_LABEL = 'Global-1';
+const MSG_PAD_TARGET     = 1024; // all encrypted payloads are padded to this many chars
+const MAX_HISTORY        = 200;  // messages kept per room when saving chat
 
 const RTC_CONFIG = {
   iceServers: [
@@ -16,11 +20,7 @@ const RTC_CONFIG = {
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
-interface ChatMessage        { username: string; text: string }
-interface VoiceStatusMessage { username: string; inVoice: boolean }
 interface PeerKeyMessage     { publicKeyBase64: string }
-interface RelayAvailMessage  { isRelay: boolean }
-interface UsernameMessage    { username: string }
 
 interface EncryptedLayer {
   ephemeralPub: string;
@@ -36,10 +36,23 @@ interface PlainInstruction {
 interface OnionForwardPacket  { circuitId: string; layer: EncryptedLayer }
 interface OnionResponsePacket { circuitId: string; data: string; isError: boolean }
 
-interface SearchResult { title: string; url: string; snippet: string; href: string }
-interface Message      { id: string; from: string; text: string; ts: number }
+interface SearchResult  { title: string; url: string; snippet: string; href: string }
+interface Message       { id: string; from: string; text: string; ts: number }
+interface RelayPeerInfo { pubKey: string; rooms: Array<{ roomId: string; peerId: string; rt: RoomRuntime }> }
 
-interface RoomDef { id: string; label: string }
+interface RoomDef { id: string; label: string; isDM?: boolean; dmFriend?: string }
+
+// Encrypted envelope sent over the wire for all non-relay, non-key messages
+interface EncMsgPacket { enc: EncryptedLayer }
+
+type EncMsgPayload =
+  | { type: 'chat';        username: string; text: string }
+  | { type: 'username';    username: string }
+  | { type: 'voiceStatus'; username: string; inVoice: boolean }
+  | { type: 'relayAvail';  isRelay: boolean }
+  | { type: 'dmInvite';    fromUsername: string; roomId: string }
+  | { type: 'relayBatch';  deliveries: Array<{ peerId: string; enc: EncryptedLayer }> }
+  | { type: 'chatHistory'; messages: Array<{ id: string; from: string; text: string; ts: number }> };
 
 interface RoomReactState {
   peers:           string[];
@@ -52,23 +65,19 @@ interface RoomReactState {
 
 interface RoomRuntime {
   trysteroRoom:    any;
-  sendChat:        ((d: ChatMessage,         t?: string | string[]) => void) | null;
-  sendUsername:    ((d: UsernameMessage,     t?: string | string[]) => void) | null;
-  sendVoiceStatus: ((d: VoiceStatusMessage,  t?: string | string[]) => void) | null;
+  sendEncMsg:      ((d: EncMsgPacket,        t?: string | string[]) => void) | null;
   sendPeerKey:     ((d: PeerKeyMessage,      t?: string | string[]) => void) | null;
-  sendRelay:       ((d: RelayAvailMessage,   t?: string | string[]) => void) | null;
   sendRelayFwd:    ((d: OnionForwardPacket,  t?: string | string[]) => void) | null;
   sendRelayResp:   ((d: OnionResponsePacket, t?: string | string[]) => void) | null;
   peerPublicKeys:  Record<string, string>;
   peerUsername:    Record<string, string>;
   usernamePeer:    Record<string, string>;
-  circuitTable:    Record<string, { returnPeer: string; expiresAt: number }>;
-  pendingCircuits: Record<string, { resolve: (d: string) => void; reject: (e: string) => void }>;
   remoteAudios:    Record<string, HTMLAudioElement>;
   remoteAnalysers: Record<string, AnalyserNode>;
-  selfStream:      MediaStream | null;
-  selfAnalyser:    AnalyserNode | null;
-  isInVoice:       boolean;
+  selfStream:       MediaStream | null;
+  selfAnalyser:     AnalyserNode | null;
+  isInVoice:        boolean;
+  announceInterval: ReturnType<typeof setInterval> | null;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -147,6 +156,73 @@ async function buildOnionPacket(
   return { circuitId, layer: enc1 };
 }
 
+// Pads a JSON string to MSG_PAD_TARGET chars by injecting a random `_p` field.
+// The receiver ignores `_p`; all messages on the wire become the same size.
+function addPadding(json: string): string {
+  // Overhead of appending `,"_p":"<pad>"}` while replacing the closing `}`:
+  // we remove 1 char (`}`) and add (8 + padLen) chars (`,"_p":"` + pad + `"}`).
+  const padLen = MSG_PAD_TARGET - json.length - 8;
+  if (padLen <= 0) return json;
+  const randBytes = crypto.getRandomValues(new Uint8Array(Math.ceil(padLen * 0.75) + 1));
+  const pad = uint8ToBase64(randBytes).slice(0, padLen);
+  return json.slice(0, -1) + `,"_p":"${pad}"}`;
+}
+
+async function encryptMsg(payload: EncMsgPayload, pubKey: string): Promise<EncMsgPacket> {
+  const enc = await encryptForPeer(addPadding(JSON.stringify(payload)), pubKey);
+  return { enc };
+}
+
+// Sends `payload` to every peer in `rt`, routing through a random mixer when
+// there are 2+ peers so that a network observer only sees traffic from us to
+// one peer, not to all of them directly.
+async function sendEncryptedToAll(rt: RoomRuntime, payload: EncMsgPayload): Promise<void> {
+  const entries = Object.entries(rt.peerPublicKeys);
+  if (entries.length === 0) return;
+
+  if (entries.length === 1) {
+    const [peerId, pubKey] = entries[0];
+    const enc = await encryptForPeer(addPadding(JSON.stringify(payload)), pubKey);
+    rt.sendEncMsg?.({ enc }, peerId);
+    return;
+  }
+
+  // Pick a random peer as the one-hop mixer.
+  const mixerIdx                   = Math.floor(Math.random() * entries.length);
+  const [mixerPeerId, mixerPubKey] = entries[mixerIdx];
+  const others                     = entries.filter((_, i) => i !== mixerIdx);
+
+  // Encrypt the payload individually for every non-mixer peer.
+  const deliveries = await Promise.all(
+    others.map(async ([peerId, pubKey]) => ({
+      peerId,
+      enc: await encryptForPeer(addPadding(JSON.stringify(payload)), pubKey),
+    }))
+  );
+
+  // Send the mixer a batch to forward to everyone else.
+  const batchEnc = await encryptForPeer(
+    addPadding(JSON.stringify({ type: 'relayBatch' as const, deliveries })),
+    mixerPubKey
+  );
+  rt.sendEncMsg?.({ enc: batchEnc }, mixerPeerId);
+
+  // Also send the mixer their own copy (they don't forward to themselves).
+  const mixerEnc = await encryptForPeer(addPadding(JSON.stringify(payload)), mixerPubKey);
+  rt.sendEncMsg?.({ enc: mixerEnc }, mixerPeerId);
+}
+
+// Sends `payload` directly to every peer without mixing — used for presence
+// messages where peerId attribution must be the true sender, not a forwarder.
+async function sendDirectToAll(rt: RoomRuntime, payload: EncMsgPayload): Promise<void> {
+  await Promise.all(
+    Object.entries(rt.peerPublicKeys).map(async ([peerId, pubKey]) => {
+      const pkt = await encryptMsg(payload, pubKey);
+      rt.sendEncMsg?.(pkt, peerId);
+    })
+  );
+}
+
 function parseSearchResults(html: string): SearchResult[] {
   const doc = new DOMParser().parseFromString(html, 'text/html');
   const out: SearchResult[] = [];
@@ -207,6 +283,68 @@ function emptyRoomState(): RoomReactState {
   return { peers: [], displayNames: {}, messages: [], inVoiceUsers: [], availableRelays: [], isInVoice: false };
 }
 
+// Exponential backoff: 2 s, 3 s, 6 s, 12 s, 24 s … capped at 5 min
+function reconnectDelay(attempt: number): number {
+  if (attempt === 0) return 2_000;
+  return Math.min(3_000 * Math.pow(2, attempt - 1), 300_000);
+}
+
+interface CircuitResult {
+  sendRt:          RoomRuntime;
+  circuit:         [string, string, string];
+  circuitPeerKeys: Record<string, string>;
+}
+
+// Builds all valid 3-hop circuits from the global relay pool across all joined rooms.
+// Consecutive hops must share a room the initiator is also in, so each intermediate
+// relay can look up and forward to the next hop via its own room connections.
+// The same physical peer (identified by public key) appearing in multiple rooms counts
+// once; their room entries are used to bridge cross-room chains.
+function findAllCrossRoomCircuits(
+  roomRuntimes:  Record<string, RoomRuntime>,
+  roomStatesSnap: Record<string, RoomReactState>,
+): CircuitResult[] {
+  const byPubKey = new Map<string, RelayPeerInfo>();
+  for (const [roomId, rt] of Object.entries(roomRuntimes)) {
+    const state = roomStatesSnap[roomId];
+    for (const peerId of (state?.availableRelays ?? [])) {
+      const pubKey = rt.peerPublicKeys[peerId];
+      if (!pubKey) continue;
+      if (!byPubKey.has(pubKey)) byPubKey.set(pubKey, { pubKey, rooms: [] });
+      byPubKey.get(pubKey)!.rooms.push({ roomId, peerId, rt });
+    }
+  }
+  const relays = [...byPubKey.values()];
+  const results: CircuitResult[] = [];
+  for (let i = 0; i < relays.length; i++) {
+    const A = relays[i];
+    for (let j = 0; j < relays.length; j++) {
+      if (j === i) continue;
+      const B = relays[j];
+      const rAB_A = A.rooms.find(ra => B.rooms.some(rb => rb.roomId === ra.roomId));
+      if (!rAB_A) continue;
+      const rAB_B = B.rooms.find(rb => rb.roomId === rAB_A.roomId)!;
+      for (let k = 0; k < relays.length; k++) {
+        if (k === i || k === j) continue;
+        const C = relays[k];
+        const rBC_B = B.rooms.find(rb => C.rooms.some(rc => rc.roomId === rb.roomId));
+        if (!rBC_B) continue;
+        const rBC_C = C.rooms.find(rc => rc.roomId === rBC_B.roomId)!;
+        results.push({
+          sendRt:  rAB_A.rt,
+          circuit: [rAB_A.peerId, rAB_B.peerId, rBC_C.peerId],
+          circuitPeerKeys: {
+            [rAB_A.peerId]: A.pubKey,
+            [rAB_B.peerId]: B.pubKey,
+            [rBC_C.peerId]: C.pubKey,
+          },
+        });
+      }
+    }
+  }
+  return results.sort(() => Math.random() - 0.5);
+}
+
 // ─── Styles ───────────────────────────────────────────────────────────────────
 
 const S: Record<string, CSSProperties> = {
@@ -263,6 +401,7 @@ const S: Record<string, CSSProperties> = {
   roomLabel:         { flex: 1, fontSize: '13px', color: '#dcddde', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const },
   roomLabelActive:   { flex: 1, fontSize: '13px', color: '#fff', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const },
   roomJoinBtn:       { padding: '2px 8px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontSize: '11px', cursor: 'pointer', flexShrink: 0 },
+  roomDeleteBtn:     { padding: '2px 6px', background: 'transparent', color: '#72767d', border: 'none', borderRadius: '4px', fontSize: '14px', cursor: 'pointer', flexShrink: 0, lineHeight: '1' },
   roomActionRow:     { display: 'flex', gap: '6px', marginTop: '6px' },
   roomCreateBtn:     { flex: 1, padding: '7px', background: '#3ba55c', color: 'white', border: 'none', borderRadius: '4px', fontSize: '12px', cursor: 'pointer' },
   roomJoinCodeBtn:   { flex: 1, padding: '7px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontSize: '12px', cursor: 'pointer' },
@@ -277,6 +416,18 @@ const S: Record<string, CSSProperties> = {
   modalBtn:          { width: '100%', padding: '10px', background: '#5865f2', color: 'white', border: 'none', borderRadius: '4px', fontSize: '14px', cursor: 'pointer', marginBottom: '8px', fontWeight: 600 },
   modalNote:         { color: '#b9bbbe', fontSize: '12px', marginBottom: '16px', lineHeight: '1.5' },
   modalCancelBtn:    { width: '100%', padding: '8px', background: 'transparent', color: '#72767d', border: '1px solid #40444b', borderRadius: '4px', fontSize: '13px', cursor: 'pointer' },
+  // DM / friends styles
+  onlineUserBtn:     { color: '#b9bbbe', margin: '3px 0', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '5px', width: '100%', background: 'none', border: 'none', padding: '2px 4px', borderRadius: '4px', cursor: 'pointer', textAlign: 'left' as const },
+  ctxMenu:           { position: 'fixed' as const, background: '#18191c', border: '1px solid #40444b', borderRadius: '6px', padding: '6px', zIndex: 300, boxShadow: '0 4px 16px rgba(0,0,0,0.6)', minWidth: '140px' },
+  ctxMenuItem:       { display: 'block', width: '100%', padding: '8px 12px', background: 'none', border: 'none', color: '#dcddde', fontSize: '13px', cursor: 'pointer', borderRadius: '4px', textAlign: 'left' as const },
+  dmBanner:          { position: 'fixed' as const, bottom: '24px', right: '24px', background: '#2f3136', border: '1px solid #5865f2', borderRadius: '8px', padding: '14px 18px', zIndex: 300, boxShadow: '0 4px 20px rgba(0,0,0,0.6)', minWidth: '240px' },
+  dmBannerTitle:     { margin: '0 0 6px', fontSize: '14px', fontWeight: 700 },
+  dmBannerSub:       { margin: '0 0 12px', fontSize: '12px', color: '#b9bbbe' },
+  dmBannerRow:       { display: 'flex', gap: '8px' },
+  dmItem:            { display: 'flex', alignItems: 'center', gap: '6px', padding: '5px 8px', borderRadius: '4px', marginBottom: '2px', cursor: 'default' },
+  dmItemActive:      { display: 'flex', alignItems: 'center', gap: '6px', padding: '5px 8px', borderRadius: '4px', marginBottom: '2px', background: '#40444b' },
+  dmLabel:           { flex: 1, fontSize: '13px', color: '#dcddde', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const },
+  dmLabelActive:     { flex: 1, fontSize: '13px', color: '#fff', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const },
 };
 
 const joinButtonOn:       CSSProperties = { width: '100%', padding: '11px', background: '#ed4245', color: 'white', border: 'none', borderRadius: '4px', fontSize: '14px', fontWeight: 600, marginBottom: '8px', cursor: 'pointer' };
@@ -298,6 +449,7 @@ function App() {
   const [newMessage, setNewMessage]         = useState('');
   const [showSetup, setShowSetup]           = useState(false);
   const [isRelayEnabled, setIsRelayEnabled] = useState(true);
+  const [acceptHistory, setAcceptHistory]   = useState(true);
   const [searchQuery, setSearchQuery]       = useState('');
   const [activeView, setActiveView]         = useState<'chat' | 'search' | 'browse'>('chat');
   const [isSearching, setIsSearching]       = useState(false);
@@ -320,6 +472,8 @@ function App() {
   const [roomModalLabel, setRoomModalLabel] = useState('');
   const [roomModalCode, setRoomModalCode]   = useState('');
   const [createdRoomCode, setCreatedRoomCode] = useState('');
+  const [pendingDmInvite, setPendingDmInvite] = useState<{ fromUsername: string; roomId: string; peerId: string } | null>(null);
+  const [userContextMenu, setUserContextMenu] = useState<{ username: string; peerId: string; x: number; y: number } | null>(null);
 
   // ── Refs ─────────────────────────────────────────────────────────────────────
   const usernameInputRef  = useRef<HTMLInputElement>(null);
@@ -329,10 +483,18 @@ function App() {
   const volumesRef        = useRef<Record<string, number>>({});
   const myPublicKeyRef    = useRef('');
   const myPrivateKeyRef   = useRef<CryptoKey | null>(null);
-  const isRelayEnabledRef = useRef(true);
+  const isRelayEnabledRef  = useRef(true);
+  const acceptHistoryRef   = useRef(true);
   const usernameRef       = useRef('');
+  const activeRoomIdRef   = useRef(DEFAULT_ROOM_ID);
   const browsePageRef     = useRef<((href: string) => void) | null>(null);
-  const roomRuntimesRef   = useRef<Record<string, RoomRuntime>>({});
+  const roomRuntimesRef    = useRef<Record<string, RoomRuntime>>({});
+  const windowFocusedRef   = useRef(true);
+  const roomPeerCountRef      = useRef<Record<string, number>>({});
+  const roomHadPeersRef       = useRef<Record<string, boolean>>({});
+  const roomReconnectAttempts = useRef<Record<string, number>>({});
+  const circuitTableRef   = useRef<Record<string, { returnRuntime: RoomRuntime; returnPeer: string; expiresAt: number }>>({});
+  const pendingCircuitsRef = useRef<Record<string, { resolve: (d: string) => void; reject: (e: string) => void }>>({});
 
   // ── Room connection helper ────────────────────────────────────────────────────
 
@@ -341,23 +503,19 @@ function App() {
 
     const runtime: RoomRuntime = {
       trysteroRoom:    null,
-      sendChat:        null,
-      sendUsername:    null,
-      sendVoiceStatus: null,
+      sendEncMsg:      null,
       sendPeerKey:     null,
-      sendRelay:       null,
       sendRelayFwd:    null,
       sendRelayResp:   null,
       peerPublicKeys:  {},
       peerUsername:    {},
       usernamePeer:    {},
-      circuitTable:    {},
-      pendingCircuits: {},
       remoteAudios:    {},
       remoteAnalysers: {},
-      selfStream:      null,
-      selfAnalyser:    null,
-      isInVoice:       false,
+      selfStream:       null,
+      selfAnalyser:     null,
+      isInVoice:        false,
+      announceInterval: null,
     };
     roomRuntimesRef.current[roomId] = runtime;
 
@@ -367,62 +525,109 @@ function App() {
     const upd = (fn: (s: RoomReactState) => RoomReactState) =>
       setRoomStates(prev => ({ ...prev, [roomId]: fn(prev[roomId] ?? emptyRoomState()) }));
 
-    const [sendUsername, getUsername] = trysteroRoom.makeAction('username');
-    runtime.sendUsername = sendUsername;
-    getUsername((data: UsernameMessage, peerId: string) => {
-      runtime.peerUsername[peerId]        = data.username;
-      runtime.usernamePeer[data.username] = peerId;
-      upd(s => ({ ...s, displayNames: { ...s.displayNames, [peerId]: data.username } }));
+    // All non-key messages travel as AES-256-GCM ciphertext encrypted for the recipient.
+    const [sendEncMsg, getEncMsg] = trysteroRoom.makeAction('encMsg');
+    runtime.sendEncMsg = sendEncMsg;
+    getEncMsg(async (data: EncMsgPacket, peerId: string) => {
+      if (!myPrivateKeyRef.current) return;
+      try {
+        const plaintext = await decryptLayer(data.enc, myPrivateKeyRef.current);
+        const payload = JSON.parse(plaintext) as EncMsgPayload;
+        switch (payload.type) {
+          case 'username':
+            runtime.peerUsername[peerId]           = payload.username;
+            runtime.usernamePeer[payload.username] = peerId;
+            upd(s => ({ ...s, displayNames: { ...s.displayNames, [peerId]: payload.username } }));
+            break;
+          case 'chat':
+            runtime.peerUsername[peerId]           = payload.username;
+            runtime.usernamePeer[payload.username] = peerId;
+            upd(s => ({
+              ...s,
+              displayNames: s.displayNames[peerId] ? s.displayNames : { ...s.displayNames, [peerId]: payload.username },
+              messages:     [...s.messages, { id: crypto.randomUUID(), from: payload.username, text: payload.text, ts: Date.now() }],
+            }));
+            if (!windowFocusedRef.current) {
+              isPermissionGranted().then(granted => {
+                if (!granted) return;
+                const roomLabel = roomDefs.find(d => d.id === roomId)?.label ?? roomId;
+                sendNotification({ title: `${payload.username} — ${roomLabel}`, body: payload.text });
+              });
+            }
+            break;
+          case 'voiceStatus':
+            runtime.peerUsername[peerId]           = payload.username;
+            runtime.usernamePeer[payload.username] = peerId;
+            upd(s => ({
+              ...s,
+              displayNames: s.displayNames[peerId] ? s.displayNames : { ...s.displayNames, [peerId]: payload.username },
+              inVoiceUsers: payload.inVoice
+                ? s.inVoiceUsers.includes(payload.username) ? s.inVoiceUsers : [...s.inVoiceUsers, payload.username]
+                : s.inVoiceUsers.filter(u => u !== payload.username),
+            }));
+            break;
+          case 'relayAvail':
+            upd(s => ({
+              ...s,
+              availableRelays: payload.isRelay
+                ? s.availableRelays.includes(peerId) ? s.availableRelays : [...s.availableRelays, peerId]
+                : s.availableRelays.filter(id => id !== peerId),
+            }));
+            break;
+          case 'dmInvite':
+            setPendingDmInvite({ fromUsername: payload.fromUsername, roomId: payload.roomId, peerId });
+            break;
+          case 'relayBatch':
+            // We are acting as a one-hop mixer: forward each delivery to its target peer.
+            for (const { peerId: targetPeerId, enc } of payload.deliveries) {
+              runtime.sendEncMsg?.({ enc }, targetPeerId);
+            }
+            break;
+          case 'chatHistory':
+            if (!acceptHistoryRef.current) break;
+            upd(s => {
+              const existingIds = new Set(s.messages.map(m => m.id));
+              const incoming    = payload.messages.filter(m => !existingIds.has(m.id));
+              if (incoming.length === 0) return s;
+              const merged = [...incoming, ...s.messages].sort((a, b) => a.ts - b.ts);
+              return { ...s, messages: merged };
+            });
+            break;
+        }
+      } catch { /* malformed packet or decryption failure — discard */ }
     });
 
-    const [sendChat, getChat] = trysteroRoom.makeAction('chat');
-    runtime.sendChat = sendChat;
-    getChat((data: ChatMessage, peerId: string) => {
-      runtime.peerUsername[peerId]        = data.username;
-      runtime.usernamePeer[data.username] = peerId;
-      upd(s => ({
-        ...s,
-        displayNames: s.displayNames[peerId] ? s.displayNames : { ...s.displayNames, [peerId]: data.username },
-        messages:     [...s.messages, { id: crypto.randomUUID(), from: data.username, text: data.text, ts: Date.now() }],
-      }));
-    });
-
-    const [sendVoiceStatus, getVoiceStatus] = trysteroRoom.makeAction('voiceStatus');
-    runtime.sendVoiceStatus = sendVoiceStatus;
-    getVoiceStatus((data: VoiceStatusMessage, peerId: string) => {
-      runtime.peerUsername[peerId]        = data.username;
-      runtime.usernamePeer[data.username] = peerId;
-      upd(s => ({
-        ...s,
-        displayNames: s.displayNames[peerId] ? s.displayNames : { ...s.displayNames, [peerId]: data.username },
-        inVoiceUsers: data.inVoice
-          ? s.inVoiceUsers.includes(data.username) ? s.inVoiceUsers : [...s.inVoiceUsers, data.username]
-          : s.inVoiceUsers.filter(u => u !== data.username),
-      }));
-    });
-
+    // peerKey is the only plaintext action: public keys are not secret.
+    // Once we receive a peer's key we immediately send them our encrypted introduction.
     const [sendPeerKey, getPeerKey] = trysteroRoom.makeAction('peerKey');
     runtime.sendPeerKey = sendPeerKey;
-    getPeerKey((data: PeerKeyMessage, peerId: string) => {
+    getPeerKey(async (data: PeerKeyMessage, peerId: string) => {
       runtime.peerPublicKeys[peerId] = data.publicKeyBase64;
-    });
+      const pubKey = data.publicKeyBase64;
+      const [usernamePacket, relayPacket, voicePacket] = await Promise.all([
+        encryptMsg({ type: 'username',    username: usernameRef.current }, pubKey),
+        encryptMsg({ type: 'relayAvail',  isRelay: isRelayEnabledRef.current }, pubKey),
+        encryptMsg({ type: 'voiceStatus', username: usernameRef.current, inVoice: runtime.isInVoice }, pubKey),
+      ]);
+      runtime.sendEncMsg?.(usernamePacket, peerId);
+      runtime.sendEncMsg?.(relayPacket,    peerId);
+      runtime.sendEncMsg?.(voicePacket,    peerId);
 
-    const [sendRelay, getRelay] = trysteroRoom.makeAction('relayAvail');
-    runtime.sendRelay = sendRelay;
-    getRelay((data: RelayAvailMessage, peerId: string) => {
-      upd(s => ({
-        ...s,
-        availableRelays: data.isRelay
-          ? s.availableRelays.includes(peerId) ? s.availableRelays : [...s.availableRelays, peerId]
-          : s.availableRelays.filter(id => id !== peerId),
-      }));
+      const savedRaw = localStorage.getItem(`p2p-history-${roomId}`);
+      if (savedRaw) {
+        try {
+          const messages = JSON.parse(savedRaw);
+          const histPacket = await encryptMsg({ type: 'chatHistory', messages }, pubKey);
+          runtime.sendEncMsg?.(histPacket, peerId);
+        } catch { /* corrupt save — ignore */ }
+      }
     });
 
     const [sendRelayFwd, getRelayFwd] = trysteroRoom.makeAction('relayFwd');
     runtime.sendRelayFwd = sendRelayFwd;
     getRelayFwd(async (data: OnionForwardPacket, senderPeerId: string) => {
       if (!isRelayEnabledRef.current || !myPrivateKeyRef.current) return;
-      runtime.circuitTable[data.circuitId] = { returnPeer: senderPeerId, expiresAt: Date.now() + 60_000 };
+      circuitTableRef.current[data.circuitId] = { returnRuntime: runtime, returnPeer: senderPeerId, expiresAt: Date.now() + 60_000 };
       try {
         const plaintext    = await decryptLayer(data.layer, myPrivateKeyRef.current);
         const instruction: PlainInstruction = JSON.parse(plaintext);
@@ -435,7 +640,16 @@ function App() {
           }
         } else {
           const nextLayer: EncryptedLayer = JSON.parse(atob(instruction.payload));
-          runtime.sendRelayFwd?.({ circuitId: data.circuitId, layer: nextLayer }, instruction.nextHop);
+          // Search all joined rooms for the next hop — enables cross-room relay chains
+          let nextRt: RoomRuntime | null = null;
+          for (const rt of Object.values(roomRuntimesRef.current)) {
+            if (rt.peerPublicKeys[instruction.nextHop]) { nextRt = rt; break; }
+          }
+          if (!nextRt) {
+            runtime.sendRelayResp?.({ circuitId: data.circuitId, data: 'Relay hop unreachable', isError: true }, senderPeerId);
+            return;
+          }
+          nextRt.sendRelayFwd?.({ circuitId: data.circuitId, layer: nextLayer }, instruction.nextHop);
         }
       } catch { /* malformed packet — discard */ }
     });
@@ -443,26 +657,28 @@ function App() {
     const [sendRelayResp, getRelayResp] = trysteroRoom.makeAction('relayResp');
     runtime.sendRelayResp = sendRelayResp;
     getRelayResp((data: OnionResponsePacket) => {
-      const pending = runtime.pendingCircuits[data.circuitId];
+      const pending = pendingCircuitsRef.current[data.circuitId];
       if (pending) {
-        delete runtime.pendingCircuits[data.circuitId];
+        delete pendingCircuitsRef.current[data.circuitId];
         if (data.isError) pending.reject(data.data);
         else              pending.resolve(data.data);
         return;
       }
-      const entry = runtime.circuitTable[data.circuitId];
+      const entry = circuitTableRef.current[data.circuitId];
       if (entry) {
-        runtime.sendRelayResp?.(data, entry.returnPeer);
-        delete runtime.circuitTable[data.circuitId];
+        entry.returnRuntime.sendRelayResp?.(data, entry.returnPeer);
+        delete circuitTableRef.current[data.circuitId];
       }
     });
 
     trysteroRoom.onPeerJoin((peerId: string) => {
+      roomPeerCountRef.current[roomId]      = (roomPeerCountRef.current[roomId] ?? 0) + 1;
+      roomHadPeersRef.current[roomId]       = true;
+      roomReconnectAttempts.current[roomId] = 0;
       upd(s => ({ ...s, peers: s.peers.includes(peerId) ? s.peers : [...s.peers, peerId] }));
+      // Send our public key; the getPeerKey handler on the other side will send back
+      // an encrypted introduction once it receives this.
       if (myPublicKeyRef.current) runtime.sendPeerKey?.({ publicKeyBase64: myPublicKeyRef.current }, peerId);
-      runtime.sendRelay?.({ isRelay: isRelayEnabledRef.current }, peerId);
-      runtime.sendUsername?.({ username: usernameRef.current }, peerId);
-      runtime.sendVoiceStatus?.({ username: usernameRef.current, inVoice: runtime.isInVoice }, peerId);
     });
 
     trysteroRoom.onPeerLeave((peerId: string) => {
@@ -487,9 +703,26 @@ function App() {
         delete runtime.peerUsername[peerId];
       }
       delete runtime.peerPublicKeys[peerId];
-      Object.keys(runtime.circuitTable).forEach(cid => {
-        if (runtime.circuitTable[cid].returnPeer === peerId) delete runtime.circuitTable[cid];
+      Object.keys(circuitTableRef.current).forEach(cid => {
+        const e = circuitTableRef.current[cid];
+        if (e.returnRuntime === runtime && e.returnPeer === peerId) delete circuitTableRef.current[cid];
       });
+
+      const remaining = Math.max(0, (roomPeerCountRef.current[roomId] ?? 1) - 1);
+      roomPeerCountRef.current[roomId] = remaining;
+      if (remaining === 0 && roomHadPeersRef.current[roomId]) {
+        const attempt = roomReconnectAttempts.current[roomId] ?? 0;
+        roomReconnectAttempts.current[roomId] = attempt + 1;
+        setTimeout(() => {
+          if (roomRuntimesRef.current[roomId] !== runtime) return;
+          if ((roomPeerCountRef.current[roomId] ?? 0) > 0) return;
+          if (runtime.announceInterval) clearInterval(runtime.announceInterval);
+          runtime.trysteroRoom?.leave();
+          delete roomRuntimesRef.current[roomId];
+          delete roomPeerCountRef.current[roomId];
+          setupRoom(roomId);
+        }, reconnectDelay(attempt));
+      }
     });
 
     trysteroRoom.onPeerStream((stream: MediaStream, peerId: string) => {
@@ -510,12 +743,35 @@ function App() {
       } catch { /* AudioContext unavailable */ }
     });
 
+    // Announce our public key on room join so any already-connected peers
+    // can initiate the encrypted key exchange with us.
     if (myPublicKeyRef.current) runtime.sendPeerKey?.({ publicKeyBase64: myPublicKeyRef.current });
-    runtime.sendRelay?.({ isRelay: isRelayEnabledRef.current });
-    runtime.sendUsername?.({ username: usernameRef.current });
+
+    // Re-announce periodically so late joiners who missed the initial broadcast
+    // pick up our key and then receive encrypted status via the getPeerKey handler.
+    runtime.announceInterval = setInterval(async () => {
+      if (myPublicKeyRef.current) runtime.sendPeerKey?.({ publicKeyBase64: myPublicKeyRef.current });
+      if (usernameRef.current) {
+        await sendDirectToAll(runtime, { type: 'username',   username: usernameRef.current });
+        await sendDirectToAll(runtime, { type: 'relayAvail', isRelay: isRelayEnabledRef.current });
+      }
+    }, 5_000);
   };
 
   // ── Effects ───────────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    (async () => {
+      const granted = await isPermissionGranted();
+      if (!granted) await requestPermission();
+    })();
+    const win = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    win.onFocusChanged(({ payload: focused }) => {
+      windowFocusedRef.current = focused;
+    }).then(fn => { unlisten = fn; });
+    return () => unlisten?.();
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -536,12 +792,22 @@ function App() {
     const savedVols = localStorage.getItem('p2p-volumes');
     if (savedVols) volumesRef.current = JSON.parse(savedVols);
 
+    if (localStorage.getItem('p2p-accept-history') === 'false') {
+      setAcceptHistory(false);
+      acceptHistoryRef.current = false;
+    }
+
     const savedRooms = localStorage.getItem('p2p-rooms');
     let defs: RoomDef[] = savedRooms
       ? JSON.parse(savedRooms)
       : [{ id: DEFAULT_ROOM_ID, label: DEFAULT_ROOM_LABEL }];
     if (!defs.find(d => d.id === DEFAULT_ROOM_ID)) {
       defs = [{ id: DEFAULT_ROOM_ID, label: DEFAULT_ROOM_LABEL }, ...defs];
+    }
+    const savedDms = localStorage.getItem('p2p-dm-rooms');
+    if (savedDms) {
+      const dmDefs: RoomDef[] = JSON.parse(savedDms);
+      defs = [...defs, ...dmDefs];
     }
     setRoomDefs(defs);
   }, []);
@@ -557,6 +823,7 @@ function App() {
   useEffect(() => {
     return () => {
       Object.values(roomRuntimesRef.current).forEach(rt => {
+        if (rt.announceInterval) clearInterval(rt.announceInterval);
         rt.trysteroRoom?.leave();
         Object.values(rt.remoteAudios).forEach(a => {
           a.pause();
@@ -617,15 +884,17 @@ function App() {
 
   const saveUsername = (name: string) => {
     if (!name.trim()) return;
+    if (name.length > 18) return;
     localStorage.setItem('p2p-username', name);
     setUsername(name);
     setShowSetup(false);
   };
 
-  const sendMessage = () => {
+  const sendMessage = async () => {
     const rt = roomRuntimesRef.current[activeRoomId];
-    if (!newMessage.trim() || !rt?.sendChat) return;
-    rt.sendChat({ username, text: newMessage });
+    if (!newMessage.trim() || !rt?.sendEncMsg) return;
+    if (newMessage.length > 800) return;
+    await sendEncryptedToAll(rt, { type: 'chat', username, text: newMessage });
     setRoomStates(prev => {
       const s = prev[activeRoomId] ?? emptyRoomState();
       return { ...prev, [activeRoomId]: { ...s, messages: [...s.messages, { id: crypto.randomUUID(), from: 'You', text: newMessage, ts: Date.now() }] } };
@@ -652,7 +921,7 @@ function App() {
     }
   };
 
-  const leaveVoiceInRoom = (roomId: string) => {
+  const leaveVoiceInRoom = async (roomId: string) => {
     const rt = roomRuntimesRef.current[roomId];
     if (!rt?.isInVoice) return;
     const myUsername = usernameRef.current;
@@ -660,7 +929,7 @@ function App() {
     rt.selfStream   = null;
     rt.selfAnalyser = null;
     rt.isInVoice    = false;
-    rt.sendVoiceStatus?.({ username: myUsername, inVoice: false });
+    await sendDirectToAll(rt, { type: 'voiceStatus', username: myUsername, inVoice: false });
     setRoomStates(prev => {
       const s = prev[roomId];
       if (!s) return prev;
@@ -691,7 +960,7 @@ function App() {
         } catch { /* AudioContext unavailable */ }
         rt.isInVoice = true;
         rt.trysteroRoom.addStream(stream);
-        rt.sendVoiceStatus?.({ username, inVoice: true });
+        await sendDirectToAll(rt, { type: 'voiceStatus', username, inVoice: true });
         setRoomStates(prev => {
           const s = prev[activeRoomId] ?? emptyRoomState();
           return { ...prev, [activeRoomId]: { ...s, inVoiceUsers: s.inVoiceUsers.includes(username) ? s.inVoiceUsers : [...s.inVoiceUsers, username], isInVoice: true } };
@@ -722,11 +991,31 @@ function App() {
     if (audio) audio.volume = volume;
   };
 
-  const toggleRelay = () => {
+  const saveChat = () => {
+    const msgs = roomStates[activeRoomId]?.messages ?? [];
+    if (msgs.length === 0) return;
+    const savable = msgs
+      .slice(-MAX_HISTORY)
+      .map(m => ({ ...m, from: m.from === 'You' ? username : m.from }));
+    localStorage.setItem(`p2p-history-${activeRoomId}`, JSON.stringify(savable));
+  };
+
+  const toggleAcceptHistory = () => {
+    const next = !acceptHistory;
+    setAcceptHistory(next);
+    acceptHistoryRef.current = next;
+    localStorage.setItem('p2p-accept-history', String(next));
+  };
+
+  const toggleRelay = async () => {
     const next = !isRelayEnabled;
     setIsRelayEnabled(next);
     isRelayEnabledRef.current = next;
-    Object.values(roomRuntimesRef.current).forEach(rt => rt.sendRelay?.({ isRelay: next }));
+    await Promise.all(
+      Object.values(roomRuntimesRef.current).map(rt =>
+        sendDirectToAll(rt, { type: 'relayAvail', isRelay: next })
+      )
+    );
   };
 
   const switchRoom = (roomId: string) => {
@@ -735,6 +1024,7 @@ function App() {
     setIsInVoice(roomRuntimesRef.current[roomId]?.isInVoice ?? false);
     setIsMuted(false);
     setActiveRoomId(roomId);
+    activeRoomIdRef.current = roomId;
     setActiveView('chat');
     setIsAtBottom(true);
   };
@@ -743,10 +1033,52 @@ function App() {
     setRoomDefs(prev => {
       if (prev.find(d => d.id === def.id)) return prev;
       const next = [...prev, def];
-      localStorage.setItem('p2p-rooms', JSON.stringify(next));
+      if (def.isDM) {
+        const dmOnly = next.filter(d => d.isDM);
+        localStorage.setItem('p2p-dm-rooms', JSON.stringify(dmOnly));
+      } else {
+        localStorage.setItem('p2p-rooms', JSON.stringify(next.filter(d => !d.isDM)));
+      }
       return next;
     });
     if (usernameRef.current) setupRoom(def.id);
+  };
+
+  const removeRoom = (roomId: string) => {
+    setRoomDefs(prev => {
+      const next = prev.filter(d => d.id !== roomId);
+      const removedIsDM = prev.find(d => d.id === roomId)?.isDM;
+      if (removedIsDM) {
+        localStorage.setItem('p2p-dm-rooms', JSON.stringify(next.filter(d => d.isDM)));
+      } else {
+        localStorage.setItem('p2p-rooms', JSON.stringify(next.filter(d => !d.isDM)));
+      }
+      return next;
+    });
+    if (activeRoomId === roomId) switchRoom(DEFAULT_ROOM_ID);
+  };
+
+  const openDm = async (targetPeerId: string, targetUsername: string) => {
+    setUserContextMenu(null);
+    const myKey    = myPublicKeyRef.current;
+    const rt       = roomRuntimesRef.current[activeRoomId];
+    const theirKey = rt?.peerPublicKeys[targetPeerId];
+    if (!myKey || !theirKey) return;
+    const keys  = [myKey.slice(0, 24), theirKey.slice(0, 24)].sort();
+    const roomId = 'dm-' + keys.join('');
+    if (roomRuntimesRef.current[roomId]) { switchRoom(roomId); return; }
+    const packet = await encryptMsg({ type: 'dmInvite', fromUsername: username, roomId }, theirKey);
+    rt.sendEncMsg?.(packet, targetPeerId);
+    addRoom({ id: roomId, label: targetUsername, isDM: true, dmFriend: targetUsername });
+    switchRoom(roomId);
+  };
+
+  const acceptDmInvite = () => {
+    if (!pendingDmInvite) return;
+    const { fromUsername, roomId } = pendingDmInvite;
+    setPendingDmInvite(null);
+    addRoom({ id: roomId, label: fromUsername, isDM: true, dmFriend: fromUsername });
+    switchRoom(roomId);
   };
 
   const handleCreateRoom = () => {
@@ -774,45 +1106,49 @@ function App() {
   };
 
   const handleSearch = async (queryOverride?: string) => {
-    const rt          = roomRuntimesRef.current[activeRoomId];
-    const activeState = roomStates[activeRoomId];
-    if (!rt) return;
     const q = (queryOverride ?? searchQuery).trim();
     if (!q) return;
-    const ready = (activeState?.availableRelays ?? []).filter(id => rt.peerPublicKeys[id]);
-    if (ready.length < 3) return;
-    const circuit = [...ready].sort(() => Math.random() - 0.5).slice(0, 3) as [string, string, string];
-    const url     = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}`;
+
+    const circuits = findAllCrossRoomCircuits(roomRuntimesRef.current, roomStates);
+    const MAX_ATTEMPTS = Math.min(3, circuits.length);
+    if (MAX_ATTEMPTS === 0) return;
+
+    const url = `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}`;
     setActiveView('search');
     setIsSearching(true);
     setSearchError(null);
     setSearchResults([]);
-    setActiveCircuit(circuit);
     if (queryOverride !== undefined) setSearchQuery(queryOverride);
-    try {
-      const packet = await buildOnionPacket(url, circuit, rt.peerPublicKeys);
-      const html = await new Promise<string>((resolve, reject) => {
-        rt.pendingCircuits[packet.circuitId] = { resolve, reject };
-        setTimeout(() => {
-          if (rt.pendingCircuits[packet.circuitId]) {
-            delete rt.pendingCircuits[packet.circuitId];
-            reject('Search timed out — a relay may have gone offline. Try again.');
-          }
-        }, 30_000);
-        rt.sendRelayFwd?.({ circuitId: packet.circuitId, layer: packet.layer }, circuit[0]);
-      });
-      setSearchResults(parseSearchResults(html));
-    } catch (err) {
-      setSearchError(String(err));
-    } finally {
-      setIsSearching(false);
+
+    let lastError = '';
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const { sendRt, circuit, circuitPeerKeys } = circuits[attempt];
+      setActiveCircuit(circuit);
+      try {
+        const packet = await buildOnionPacket(url, circuit, circuitPeerKeys);
+        const html = await new Promise<string>((resolve, reject) => {
+          pendingCircuitsRef.current[packet.circuitId] = { resolve, reject };
+          setTimeout(() => {
+            if (pendingCircuitsRef.current[packet.circuitId]) {
+              delete pendingCircuitsRef.current[packet.circuitId];
+              reject('Search timed out — a relay may have gone offline.');
+            }
+          }, 30_000);
+          sendRt.sendRelayFwd?.({ circuitId: packet.circuitId, layer: packet.layer }, circuit[0]);
+        });
+        setSearchResults(parseSearchResults(html));
+        setIsSearching(false);
+        return;
+      } catch (err) {
+        lastError = String(err);
+      }
     }
+
+    setSearchError(lastError + (MAX_ATTEMPTS > 1 ? ' (tried multiple circuits)' : ' Try again.'));
+    setIsSearching(false);
   };
 
   const browsePage = async (href: string) => {
-    const rt          = roomRuntimesRef.current[activeRoomId];
-    const activeState = roomStates[activeRoomId];
-    if (!rt) return;
     let url = href;
     if (url.startsWith('//')) url = 'https:' + url;
     try {
@@ -821,33 +1157,45 @@ function App() {
       if (uddg) url = uddg;
     } catch { return; }
 
-    const ready = (activeState?.availableRelays ?? []).filter(id => rt.peerPublicKeys[id]);
-    if (ready.length < 3) return;
-
-    const circuit = [...ready].sort(() => Math.random() - 0.5).slice(0, 3) as [string, string, string];
+    const circuits = findAllCrossRoomCircuits(roomRuntimesRef.current, roomStates);
+    if (circuits.length === 0) return;
 
     setIsBrowsing(true);
     setBrowseUrl(url);
-    setBrowseCircuit(circuit);
     setActiveView('browse');
 
-    try {
-      const packet = await buildOnionPacket(url, circuit, rt.peerPublicKeys);
-      const html = await new Promise<string>((resolve, reject) => {
-        rt.pendingCircuits[packet.circuitId] = { resolve, reject };
-        setTimeout(() => {
-          if (rt.pendingCircuits[packet.circuitId]) {
-            delete rt.pendingCircuits[packet.circuitId];
-            reject('Page load timed out.');
-          }
-        }, 30_000);
-        rt.sendRelayFwd?.({ circuitId: packet.circuitId, layer: packet.layer }, circuit[0]);
-      });
+    const MAX_ATTEMPTS = Math.min(3, circuits.length);
+    let lastError = '';
+    let html = '';
 
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const { sendRt, circuit, circuitPeerKeys } = circuits[attempt];
+      setBrowseCircuit(circuit);
+      try {
+        const packet = await buildOnionPacket(url, circuit, circuitPeerKeys);
+        html = await new Promise<string>((resolve, reject) => {
+          pendingCircuitsRef.current[packet.circuitId] = { resolve, reject };
+          setTimeout(() => {
+            if (pendingCircuitsRef.current[packet.circuitId]) {
+              delete pendingCircuitsRef.current[packet.circuitId];
+              reject('Page load timed out.');
+            }
+          }, 30_000);
+          sendRt.sendRelayFwd?.({ circuitId: packet.circuitId, layer: packet.layer }, circuit[0]);
+        });
+        break; // success
+      } catch (err) {
+        lastError = String(err);
+        html = '';
+      }
+    }
+
+    try {
+      if (!html) throw new Error(lastError);
       const doc = new DOMParser().parseFromString(html, 'text/html');
       const csp = doc.createElement('meta');
       csp.setAttribute('http-equiv', 'Content-Security-Policy');
-      csp.setAttribute('content', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; font-src data:;");
+      csp.setAttribute('content', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src https: http: data: blob:; font-src https: http: data:; media-src https: http: data: blob:;");
       doc.head.prepend(csp);
       const base = doc.createElement('base');
       base.setAttribute('href', url);
@@ -870,11 +1218,22 @@ function App() {
   const activeState     = roomStates[activeRoomId] ?? emptyRoomState();
   const activeRuntime   = roomRuntimesRef.current[activeRoomId];
   const onlineList      = [username, ...activeState.peers.map(id => activeState.displayNames[id] ?? `User-${id.slice(0, 6)}`)];
-  const canSearch       = activeState.availableRelays.length >= 3;
-  const relayShortfall  = Math.max(0, 3 - activeState.availableRelays.length);
-  const relayDotColor   = activeState.availableRelays.length >= 3 ? '#3ba55c' : activeState.availableRelays.length >= 1 ? '#faa61a' : '#ed4245';
   const isConnected     = activeState.peers.length > 0;
   const activeRoomLabel = roomDefs.find(d => d.id === activeRoomId)?.label ?? activeRoomId;
+
+  // Count unique relay peers (by public key) across all joined rooms
+  const _seenRelayKeys = new Set<string>();
+  for (const [roomId, rt] of Object.entries(roomRuntimesRef.current)) {
+    const state = roomStates[roomId];
+    for (const peerId of (state?.availableRelays ?? [])) {
+      const k = rt.peerPublicKeys[peerId];
+      if (k) _seenRelayKeys.add(k);
+    }
+  }
+  const globalRelayCount = _seenRelayKeys.size;
+  const canSearch        = globalRelayCount >= 3;
+  const relayShortfall   = Math.max(0, 3 - globalRelayCount);
+  const relayDotColor    = globalRelayCount >= 3 ? '#3ba55c' : globalRelayCount >= 1 ? '#faa61a' : '#ed4245';
 
   // ── Render ────────────────────────────────────────────────────────────────────
 
@@ -891,6 +1250,7 @@ function App() {
             ref={usernameInputRef}
             type="text"
             placeholder="Enter username"
+            maxLength={18}
             onKeyDown={e => e.key === 'Enter' && saveUsername(usernameInputRef.current?.value ?? '')}
             style={S.setupInput}
           />
@@ -920,9 +1280,18 @@ function App() {
 
         <div style={S.sectionHeader}>Online — {onlineList.length}</div>
         {onlineList.map(user => (
-          <div key={`online-${user}`} style={S.onlineUser}>
+          <button
+            key={`online-${user}`}
+            style={S.onlineUserBtn}
+            onClick={e => {
+              if (user === username) return;
+              const peerId = activeRuntime?.usernamePeer[user];
+              if (!peerId) return;
+              setUserContextMenu({ username: user, peerId, x: e.clientX, y: e.clientY });
+            }}
+          >
             <span style={{ color: '#3ba55c', fontSize: '13px' }}>●</span>{user}
-          </div>
+          </button>
         ))}
 
         <hr style={S.hr} />
@@ -947,6 +1316,26 @@ function App() {
             </div>
           );
         })}
+
+        {/* ── Direct Messages ── */}
+        {roomDefs.some(d => d.isDM) && (
+          <>
+            <hr style={S.hr} />
+            <div style={S.sectionHeader}>Direct Messages</div>
+            {roomDefs.filter(d => d.isDM).map(def => (
+              <div key={def.id} style={activeRoomId === def.id ? S.dmItemActive : S.dmItem}>
+                <span style={{ fontSize: '13px', color: '#72767d' }}>@</span>
+                <span style={activeRoomId === def.id ? S.dmLabelActive : S.dmLabel} title={def.label}>
+                  {def.label}
+                </span>
+                {activeRoomId !== def.id && (
+                  <button onClick={() => switchRoom(def.id)} style={S.roomJoinBtn}>Open</button>
+                )}
+                <button onClick={() => removeRoom(def.id)} style={S.roomDeleteBtn} title="Remove">×</button>
+              </div>
+            ))}
+          </>
+        )}
       </div>
 
       {/* ── Main area: Chat / Search / Browse ── */}
@@ -973,7 +1362,7 @@ function App() {
               )}
               <iframe
                 srcDoc={browseHtml}
-                sandbox="allow-scripts"
+                sandbox="allow-scripts allow-same-origin"
                 style={{ width: '100%', height: '100%', border: 'none', background: 'white' }}
                 title="Browse"
               />
@@ -1002,9 +1391,10 @@ function App() {
               <div style={S.inputFlex}>
                 <input
                   value={newMessage}
-                  onChange={e => setNewMessage(e.target.value)}
+                  onChange={e => setNewMessage(e.target.value.slice(0, 800))}
                   onKeyDown={e => e.key === 'Enter' && sendMessage()}
                   placeholder="Type a message…"
+                  maxLength={800}
                   style={S.messageInput}
                 />
                 <button onClick={sendMessage} style={S.sendButton}>Send</button>
@@ -1067,13 +1457,22 @@ function App() {
 
         <hr style={S.hr} />
 
+        <button onClick={saveChat} style={{ width: '100%', padding: '9px', background: '#40444b', color: '#dcddde', border: 'none', borderRadius: '4px', marginBottom: '4px', fontSize: '13px', cursor: 'pointer' }}>
+          Save Chat
+        </button>
+        <button onClick={toggleAcceptHistory} style={{ width: '100%', padding: '9px', background: acceptHistory ? '#3ba55c' : '#40444b', color: acceptHistory ? 'white' : '#b9bbbe', border: 'none', borderRadius: '4px', marginBottom: '2px', fontSize: '13px', cursor: 'pointer' }}>
+          {acceptHistory ? 'Accept History: ON' : 'Accept History: OFF'}
+        </button>
+
+        <hr style={S.hr} />
+
         <button onClick={toggleRelay} style={isRelayEnabled ? relayButtonOn : relayButtonOff}>
           {isRelayEnabled ? 'Relay: ON' : 'Relay: OFF'}
         </button>
         <div style={S.relayRow}>
           <span style={{ color: relayDotColor, fontSize: '14px' }}>●</span>
           <span style={S.relayCount}>
-            {activeState.availableRelays.length} relay{activeState.availableRelays.length !== 1 ? 's' : ''} online
+            {globalRelayCount} relay{globalRelayCount !== 1 ? 's' : ''} online
           </span>
         </div>
 
@@ -1112,7 +1511,7 @@ function App() {
 
         {/* ── Room list ── */}
         <div style={S.sectionHeader}>Rooms</div>
-        {roomDefs.map(def => (
+        {roomDefs.filter(d => !d.isDM).map(def => (
           <div key={def.id} style={activeRoomId === def.id ? S.roomItemActive : S.roomItem}>
             <span style={activeRoomId === def.id ? S.roomLabelActive : S.roomLabel} title={def.label}>
               {def.label}
@@ -1122,6 +1521,9 @@ function App() {
             )}
             {activeRoomId !== def.id && (
               <button onClick={() => switchRoom(def.id)} style={S.roomJoinBtn}>Join</button>
+            )}
+            {def.id !== DEFAULT_ROOM_ID && (
+              <button onClick={() => removeRoom(def.id)} style={S.roomDeleteBtn} title="Remove room">×</button>
             )}
           </div>
         ))}
@@ -1199,6 +1601,38 @@ function App() {
               </>
             )}
 
+          </div>
+        </div>
+      )}
+
+      {/* ── User context menu ── */}
+      {userContextMenu && (
+        <div
+          style={{ ...S.ctxMenu, left: userContextMenu.x, top: userContextMenu.y }}
+          onMouseLeave={() => setUserContextMenu(null)}
+        >
+          <div style={{ padding: '4px 12px 8px', fontSize: '12px', color: '#72767d', fontWeight: 700 }}>
+            {userContextMenu.username}
+          </div>
+          <button
+            style={S.ctxMenuItem}
+            onMouseEnter={e => (e.currentTarget.style.background = '#5865f2')}
+            onMouseLeave={e => (e.currentTarget.style.background = 'none')}
+            onClick={() => openDm(userContextMenu.peerId, userContextMenu.username)}
+          >
+            Message
+          </button>
+        </div>
+      )}
+
+      {/* ── DM invite banner ── */}
+      {pendingDmInvite && (
+        <div style={S.dmBanner}>
+          <p style={S.dmBannerTitle}>Friend request</p>
+          <p style={S.dmBannerSub}>{pendingDmInvite.fromUsername} wants to message you</p>
+          <div style={S.dmBannerRow}>
+            <button style={{ ...S.modalBtn, margin: 0, flex: 1 }} onClick={acceptDmInvite}>Accept</button>
+            <button style={{ ...S.modalCancelBtn, flex: 1 }} onClick={() => setPendingDmInvite(null)}>Decline</button>
           </div>
         </div>
       )}

@@ -7,10 +7,14 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "tauri": "tauri",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "tauri:dev:dev": "tauri dev --config src-tauri/tauri.dev.conf.json -- --features dev-build",
+    "tauri:build:dev": "tauri build --config src-tauri/tauri.dev.conf.json -- --features dev-build",
+    "tauri:build:all": "tauri build && tauri build --config src-tauri/tauri.dev.conf.json -- --features dev-build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-notification": "^2.3.3",
     "peerjs": "^1.5.5",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",

@@ -1,4 +1,6 @@
 use tauri::Manager;
+
+#[cfg(not(feature = "dev-build"))]
 use tauri_plugin_single_instance::init as single_instance;
 
 // Makes an outbound HTTP GET from the exit relay's machine, bypassing WebView CORS.
@@ -28,19 +30,25 @@ fn open_url(url: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(single_instance(|app, _args, _cwd| {
-            // A second instance tried to launch — bring the existing window to front and exit.
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
-        }))
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init());
+
+    // Dev builds allow multiple instances so you can test messaging between windows.
+    // Production enforces single-instance and focuses the existing window instead.
+    #[cfg(not(feature = "dev-build"))]
+    let builder = builder.plugin(single_instance(|app, _args, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+    }));
+
+    builder
         .invoke_handler(tauri::generate_handler![relay_fetch, open_url])
         .setup(|app| {
-            // Register the app to launch on Windows startup via the current-user Run key.
-            // Uses the path of the running executable so it always points to the installed copy.
-            #[cfg(target_os = "windows")]
+            // Production only: register in Windows startup and auto-minimize on launch.
+            // Dev builds skip both so instances are immediately visible for testing.
+            #[cfg(all(target_os = "windows", not(feature = "dev-build")))]
             {
                 if let Ok(exe) = std::env::current_exe() {
                     let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
@@ -49,7 +57,7 @@ pub fn run() {
                     }
                 }
             }
-            // Start minimized so the app sits quietly in the taskbar on auto-launch
+            #[cfg(not(feature = "dev-build"))]
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.minimize();
             }
