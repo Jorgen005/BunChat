@@ -29,7 +29,4 @@ tauri-plugin-log = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-notification = "2"
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
-open = "5"
-
-[target.'cfg(target_os = "windows")'.dependencies]
-winreg = "0.52"
+url = "2"
