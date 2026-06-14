@@ -8,6 +8,10 @@ import {
   type RatchetSession, type RatchetMessage,
 } from './ratchet';
 import {
+  createSenderKey, distributionMessage, importDistribution, senderEncrypt, senderDecrypt,
+  type SenderMessage, type SenderKeyDistribution, type OutboundSenderState, type InboundSenderState,
+} from './senderkeys';
+import {
   loadOrCreateIdentity, loadOrCreateHistoryKey, encryptHistory, decryptHistory,
 } from './secureStore';
 
@@ -52,10 +56,12 @@ interface RelayPeerInfo { pubKey: string; rooms: Array<{ roomId: string; peerId:
 
 interface RoomDef { id: string; label: string; isDM?: boolean; dmFriend?: string }
 
-// Envelope sent over the wire for all non-relay, non-key messages. Either a
-// Double Ratchet message (1:1 conversations) or an ECIES layer (group rooms,
-// and the warm-up window before a ratchet session can send).
-type EncMsgPacket = { enc: EncryptedLayer } | { rk: RatchetMessage }
+// Envelope sent over the wire for all non-relay, non-key messages. One of:
+//   rk  — a Double Ratchet message (1:1 conversations)
+//   sk  — a Sender Keys message (group chat: one ciphertext for the whole room)
+//   enc — an ECIES layer (presence, mixer batches, and the warm-up window before
+//         a ratchet/sender-key session is ready)
+type EncMsgPacket = { enc: EncryptedLayer } | { rk: RatchetMessage } | { sk: SenderMessage }
 
 type EncMsgPayload =
   | { type: 'chat';        id: string; username: string; text: string }
@@ -64,6 +70,7 @@ type EncMsgPayload =
   | { type: 'relayAvail';  isRelay: boolean; isExit: boolean }
   | { type: 'dmInvite';    fromUsername: string; roomId: string }
   | { type: 'relayBatch';  blobs: EncryptedLayer[] }
+  | { type: 'senderKey';   dist: SenderKeyDistribution }
   | { type: 'chatHistory'; messages: Array<{ id: string; from: string; text: string; ts: number }> };
 
 interface RoomReactState {
@@ -85,6 +92,8 @@ interface RoomRuntime {
   sendRelayResp:   ((d: OnionResponsePacket, t?: string | string[]) => void) | null;
   peerPublicKeys:  Record<string, string>;
   ratchetSessions: Record<string, RatchetSession>; // peerId -> 1:1 Double Ratchet session
+  outboundSenderKey: OutboundSenderState | null;     // our group sender key for this room
+  inboundSenderKeys: Record<string, InboundSenderState>; // sender pubKeyB64 -> their group chain
   peerUsername:    Record<string, string>;
   usernamePeer:    Record<string, string>;
   remoteAudios:    Record<string, HTMLAudioElement>;
@@ -267,6 +276,18 @@ async function sendEncryptedToAll(rt: RoomRuntime, payload: EncMsgPayload): Prom
   if (entries.length === 1) {
     // Single peer (DM / 2-person room) — ratchet if the session is ready.
     await sendToPeer(rt, entries[0][0], payload);
+    return;
+  }
+
+  // Group (2+ peers): chat is encrypted ONCE under our Sender Key and broadcast —
+  // every member decrypts the same ciphertext with their own copy of our chain,
+  // and each message key is ratcheted away for forward secrecy. (Other payload
+  // types fall through to the per-recipient ECIES mixer path below. NOTE: unlike
+  // that path, this broadcasts directly rather than via the one-hop mixer —
+  // routing the single sender-key ciphertext through a mixer is a follow-up.)
+  if (payload.type === 'chat' && rt.outboundSenderKey) {
+    const sm = await senderEncrypt(rt.outboundSenderKey, new TextEncoder().encode(addPadding(JSON.stringify(payload))));
+    for (const peerId of Object.keys(rt.peerPublicKeys)) rt.sendEncMsg?.({ sk: sm }, peerId);
     return;
   }
 
@@ -646,6 +667,8 @@ function App() {
       sendRelayResp:   null,
       peerPublicKeys:  {},
       ratchetSessions: {},
+      outboundSenderKey: null,
+      inboundSenderKeys: {},
       peerUsername:    {},
       usernamePeer:    {},
       remoteAudios:    {},
@@ -656,6 +679,17 @@ function App() {
       announceInterval: null,
     };
     roomRuntimesRef.current[roomId] = runtime;
+
+    // Mint this room's group Sender Key, then hand its distribution to anyone
+    // already connected. Peers who connect later get it during key exchange (see
+    // getPeerKey). Until it's ready, group chat degrades gracefully to ECIES.
+    void createSenderKey().then(async sk => {
+      runtime.outboundSenderKey = sk;
+      const dist = distributionMessage(sk);
+      for (const pid of Object.keys(runtime.peerPublicKeys)) {
+        await sendToPeer(runtime, pid, { type: 'senderKey', dist });
+      }
+    });
 
     // Our public key + ratchet prekey, sent so peers can key-exchange and start a
     // Double Ratchet session with us.
@@ -682,6 +716,15 @@ function App() {
           const session = runtime.ratchetSessions[peerId];
           if (!session) return;
           plaintext = new TextDecoder().decode(await ratchetDecrypt(session, data.rk));
+        } else if ('sk' in data) {
+          // Group Sender Key message — decrypt with the inbound chain we hold for
+          // this sender's identity key. Keying on the transport sender's pubkey
+          // means a peer can't pass off another member's chain as its own: the
+          // ECDSA signature would verify against the wrong signing key and fail.
+          const senderPub = runtime.peerPublicKeys[peerId];
+          const inbound   = senderPub ? runtime.inboundSenderKeys[senderPub] : undefined;
+          if (!inbound) return; // no distribution from this sender yet — drop
+          plaintext = new TextDecoder().decode(await senderDecrypt(inbound, data.sk));
         } else {
           plaintext = await decryptLayer(data.enc, myPrivateKeyRef.current);
         }
@@ -746,6 +789,13 @@ function App() {
               }
             }
             break;
+          case 'senderKey': {
+            // The sender handed us their group chain (over this secure channel).
+            // Store it under their identity key so we can decrypt their broadcasts.
+            const senderPub = runtime.peerPublicKeys[peerId];
+            if (senderPub) runtime.inboundSenderKeys[senderPub] = await importDistribution(payload.dist);
+            break;
+          }
           case 'chatHistory':
             if (!acceptHistoryRef.current) break;
             upd(s => {
@@ -768,6 +818,9 @@ function App() {
     const [sendPeerKey, getPeerKey] = trysteroRoom.makeAction('peerKey');
     runtime.sendPeerKey = sendPeerKey;
     getPeerKey(async (data: PeerKeyMessage, peerId: string) => {
+      // peerKey is re-announced every few seconds; only the first sighting of a
+      // peer is treated as new (drives one-time setup like sender-key handoff).
+      const isNewPeer = !runtime.peerPublicKeys[peerId];
       runtime.peerPublicKeys[peerId] = data.publicKeyBase64;
       const pubKey = data.publicKeyBase64;
       // Derive and surface this peer's safety-number fingerprint.
@@ -801,6 +854,13 @@ function App() {
       await sendToPeer(runtime, peerId, { type: 'username',    username: usernameRef.current });
       await sendToPeer(runtime, peerId, { type: 'relayAvail',  isRelay: isRelayEnabledRef.current, isExit: isExitEnabledRef.current });
       await sendToPeer(runtime, peerId, { type: 'voiceStatus', username: usernameRef.current, inVoice: runtime.isInVoice });
+
+      // Hand a newly-seen peer our group sender key once (over this secure
+      // channel) so they can decrypt our group broadcasts. Re-sending on every
+      // announcement would reset their chain past messages they hadn't read yet.
+      if (isNewPeer && runtime.outboundSenderKey) {
+        await sendToPeer(runtime, peerId, { type: 'senderKey', dist: distributionMessage(runtime.outboundSenderKey) });
+      }
 
       const savedRaw = localStorage.getItem(`p2p-history-${roomId}`);
       if (savedRaw && historyKeyRef.current) {
@@ -883,6 +943,7 @@ function App() {
 
     trysteroRoom.onPeerLeave((peerId: string) => {
       const leavingUsername = runtime.peerUsername[peerId];
+      const leavingPubKey   = runtime.peerPublicKeys[peerId];
       upd(s => ({
         ...s,
         peers:           s.peers.filter(id => id !== peerId),
@@ -906,6 +967,20 @@ function App() {
       }
       delete runtime.peerPublicKeys[peerId];
       delete runtime.ratchetSessions[peerId]; // ratchet sessions are per-connection; re-handshake on rejoin
+      if (leavingPubKey) delete runtime.inboundSenderKeys[leavingPubKey];
+
+      // Membership rekey: a departed member still holds a copy of our sender chain
+      // and could ratchet it forward, so mint a fresh chain and redistribute it to
+      // the remaining members. Anything we send next is unreadable to the leaver.
+      if (runtime.outboundSenderKey && Object.keys(runtime.peerPublicKeys).length > 0) {
+        void createSenderKey().then(async sk => {
+          runtime.outboundSenderKey = sk;
+          const dist = distributionMessage(sk);
+          for (const pid of Object.keys(runtime.peerPublicKeys)) {
+            await sendToPeer(runtime, pid, { type: 'senderKey', dist });
+          }
+        });
+      }
       Object.keys(circuitTableRef.current).forEach(cid => {
         const e = circuitTableRef.current[cid];
         if (e.returnRuntime === runtime && e.returnPeer === peerId) delete circuitTableRef.current[cid];
