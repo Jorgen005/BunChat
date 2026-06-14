@@ -13,7 +13,9 @@
     "tauri:build:all": "tauri build && tauri build --config src-tauri/tauri.dev.conf.json -- --features dev-build"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.0.0",
+    "@fontsource-variable/geist": "^5.2.9",
+    "@fontsource-variable/geist-mono": "^5.2.8",
+    "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-notification": "^2.3.3",
     "peerjs": "^1.5.5",
     "react": "^19.2.4",
@@ -22,7 +24,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
-    "@tauri-apps/cli": "^2.10.1",
+    "@tauri-apps/cli": "^2.11.2",
     "@types/node": "^24.12.2",
     "@types/peerjs": "^0.0.30",
     "@types/react": "^19.2.14",

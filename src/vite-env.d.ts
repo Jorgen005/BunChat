@@ -5,3 +5,7 @@ declare module 'trystero' {
   export const selfId: string;
   // Add more if you get other errors later
 }
+
+// Self-hosted font CSS (side-effect imports, no type declarations of their own).
+declare module '@fontsource-variable/geist';
+declare module '@fontsource-variable/geist-mono';
